@@ -1,0 +1,121 @@
+version: '3.8'
+
+# MIT App Inventor Rendezvous Server with Redis
+# ===============================================
+# This docker-compose configuration deploys the rendezvous server
+# with Redis for Google-free infrastructure.
+#
+# Usage:
+#   docker-compose up -d          # Start in background
+#   docker-compose logs -f        # View logs
+#   docker-compose down           # Stop services
+#   docker-compose ps             # Check status
+
+services:
+  # Rendezvous Server (WebRTC Signaling)
+  rendezvous:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: appinventor-rendezvous
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Cache backend configuration
+      - CACHE_BACKEND=redis
+
+      # Redis connection (use service name as hostname in docker-compose)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}  # Optional, from .env file
+
+      # Node.js environment
+      - NODE_ENV=production
+
+    depends_on:
+      - redis
+
+    volumes:
+      # SQLite database for statistics
+      - rendezvous-data:/data
+
+      # Optional: mount logs if you want to persist them
+      # - ./logs:/var/log/supervisor
+
+    networks:
+      - appinventor-network
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/rendezvous/test"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Redis Cache Server
+  redis:
+    image: redis:7-alpine
+    container_name: appinventor-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"  # Expose for debugging (optional, can be removed for production)
+
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+
+    volumes:
+      - redis-data:/data
+
+    networks:
+      - appinventor-network
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # Optional: Redis Commander (Web UI for Redis debugging)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: appinventor-redis-ui
+    restart: unless-stopped
+    profiles:
+      - debug  # Only start when using: docker-compose --profile debug up
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0${REDIS_PASSWORD:+:$REDIS_PASSWORD}
+    depends_on:
+      - redis
+    networks:
+      - appinventor-network
+
+# Persistent volumes
+volumes:
+  rendezvous-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+
+  redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./redis-data
+
+# Network
+networks:
+  appinventor-network:
+    driver: bridge

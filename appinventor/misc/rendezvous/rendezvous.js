@@ -7,9 +7,27 @@ var exec = require('child_process').exec;
 // var sys = require('sys');
 var path = require('path');
 var requestHandler = http.IncomingMessage.prototype;
-var memcache = require('memcache');
-var mc = new memcache.Client();
+
+// CACHE BACKEND CONFIGURATION
+// ============================
+// This server supports two cache backends:
+// 1. Memcache (Google App Engine) - Original MIT implementation
+// 2. Redis (Standalone) - For Google-free deployment
+//
+// To switch between backends, set the CACHE_BACKEND environment variable:
+// - CACHE_BACKEND=memcache (default, for Google App Engine)
+// - CACHE_BACKEND=redis (for standalone deployment)
+//
+// Original Google App Engine Memcache code (kept for reference and easy rollback):
+// var memcache = require('memcache');
+// var mc = new memcache.Client();
+// mc.connect();
+
+// New unified cache adapter (supports both Memcache and Redis)
+var CacheAdapter = require('./cache-adapter');
+var mc = new CacheAdapter();
 mc.connect();
+
 var querystring = require('querystring');
 var fs = require('fs');
 var wp = require('workerpool');

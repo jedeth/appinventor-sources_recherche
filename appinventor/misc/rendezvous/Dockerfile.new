@@ -1,0 +1,69 @@
+# MIT App Inventor Rendezvous Server
+# Dockerfile for Google-free deployment with Redis
+# ==================================================
+#
+# This Dockerfile builds the rendezvous server with support for both
+# Memcache (Google App Engine) and Redis (standalone) backends.
+#
+# Build:
+#   docker build -f Dockerfile.new -t appinventor-rendezvous:2.1.0 .
+#
+# Run with Redis:
+#   docker run -e CACHE_BACKEND=redis -e REDIS_HOST=redis -p 3000:3000 appinventor-rendezvous:2.1.0
+#
+# Run with Memcache:
+#   docker run -e CACHE_BACKEND=memcache -p 3000:3000 appinventor-rendezvous:2.1.0
+
+FROM node:16-alpine
+
+LABEL maintainer="MIT App Inventor <appinventor@mit.edu>"
+LABEL version="2.1.0"
+LABEL description="MIT App Inventor Rendezvous Server with Redis support"
+
+# Install system dependencies
+RUN apk add --no-cache \
+    sqlite \
+    supervisor \
+    curl \
+    && rm -rf /var/cache/apk/*
+
+# Create application directory
+RUN mkdir -p /opt/rendezvous
+WORKDIR /opt/rendezvous
+
+# Copy package files first (for better Docker layer caching)
+COPY package.json ./
+
+# Install Node.js dependencies
+RUN npm install --production && \
+    npm cache clean --force
+
+# Copy application files
+COPY rendezvous.js ./
+COPY cache-adapter.js ./
+COPY logworker.js ./
+
+# Copy supervisor configuration (if exists)
+# Note: This will fail gracefully if the file doesn't exist
+COPY supervisord.conf /etc/supervisor/supervisord.conf 2>/dev/null || \
+    echo "[supervisord]\nnodaemon=true\n\n[program:rendezvous]\ncommand=node /opt/rendezvous/rendezvous.js\nautostart=true\nautorestart=true\nstdout_logfile=/dev/stdout\nstderr_logfile=/dev/stderr\nstdout_maxbytes=0\nstderr_maxbytes=0" > /etc/supervisor/supervisord.conf
+
+# Create data volume for SQLite database
+VOLUME /data
+
+# Expose port 3000
+EXPOSE 3000
+
+# Environment variables (can be overridden at runtime)
+ENV CACHE_BACKEND=redis \
+    REDIS_HOST=redis \
+    REDIS_PORT=6379 \
+    REDIS_DB=0 \
+    NODE_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/rendezvous/test || exit 1
+
+# Start supervisor (which manages the Node.js process)
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]

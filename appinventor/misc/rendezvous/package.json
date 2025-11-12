@@ -1,10 +1,11 @@
 {
   "name": "rendezvous2",
-  "version": "2.0.0",
-  "description": "MIT App Inventor Rendezvous Server",
+  "version": "2.1.0",
+  "description": "MIT App Inventor Rendezvous Server (Google-free compatible)",
   "main": "rendezvous.js",
   "dependencies": {
     "memcache": "^0.3.0",
+    "redis": "^3.1.2",
     "workerpool": "^2.3.1",
     "object-assign": "^4.1.1",
     "sqlite3": "^3.1.13",
@@ -12,8 +13,22 @@
   },
   "devDependencies": {},
   "scripts": {
+    "start": "node rendezvous.js",
+    "start:redis": "CACHE_BACKEND=redis node rendezvous.js",
+    "start:memcache": "CACHE_BACKEND=memcache node rendezvous.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "engines": {
+    "node": ">=10.0.0"
+  },
   "author": "Jeffrey I. Schiller <jis@mit.edu>",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "keywords": [
+    "app-inventor",
+    "rendezvous",
+    "webrtc",
+    "signaling",
+    "redis",
+    "memcache"
+  ]
 }
