@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MIT App Inventor - Storage Backend Configuration Example
+  ========================================================
+
+  This file shows examples of how to configure different storage backends
+  for MIT App Inventor, enabling deployment on infrastructure independent
+  of Google Cloud Storage.
+
+  IMPORTANT: Copy this file to appengine-web.xml and uncomment/modify
+  the section for your chosen backend.
+-->
+
+<appengine-web-app xmlns="http://appengine.google.com/ns/1.0">
+  <application>your-app-name</application>
+  <version>1</version>
+  <runtime>java17</runtime>
+
+  <sessions-enabled>false</sessions-enabled>
+  <threadsafe>true</threadsafe>
+
+  <!-- ============================================================ -->
+  <!-- OPTION 1: Google Cloud Storage (Original MIT Implementation) -->
+  <!-- ============================================================ -->
+  <!--
+    Use this configuration for deploying on Google App Engine with
+    Google Cloud Storage (the original MIT App Inventor setup).
+
+    This is the DEFAULT if storage.backend is not specified.
+  -->
+  <!--
+  <system-properties>
+    <property name="storage.backend" value="gcs" />
+    <property name="gcs.bucket" value="your-gcs-bucket-name" />
+    <property name="gcs.apkbucket" value="your-apk-bucket-name" />
+  </system-properties>
+  -->
+
+
+  <!-- ============================================================ -->
+  <!-- OPTION 2: Amazon S3 (AWS) -->
+  <!-- ============================================================ -->
+  <!--
+    Use this configuration for deploying on AWS with Amazon S3 storage.
+
+    Required:
+    - S3 bucket(s) created in your AWS account
+    - IAM user with programmatic access (access key + secret key)
+    - Permissions: s3:PutObject, s3:GetObject, s3:DeleteObject, s3:ListBucket
+
+    Security Note: For production, use AWS Secrets Manager or environment
+    variables instead of storing keys in appengine-web.xml
+  -->
+  <!--
+  <system-properties>
+    <property name="storage.backend" value="s3" />
+
+    <!- - S3 Configuration - ->
+    <property name="s3.endpoint" value="" />  <!- - Empty for AWS S3 - ->
+    <property name="s3.region" value="us-east-1" />
+    <property name="s3.access.key" value="AKIAIOSFODNN7EXAMPLE" />
+    <property name="s3.secret.key" value="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" />
+    <property name="s3.path.style" value="false" />  <!- - AWS S3 uses virtual-hosted style - ->
+
+    <!- - Bucket Configuration - ->
+    <!- - Note: These use the same property names as GCS for compatibility - ->
+    <property name="gcs.bucket" value="your-s3-bucket-name" />
+    <property name="gcs.apkbucket" value="your-apk-s3-bucket-name" />
+  </system-properties>
+  -->
+
+
+  <!-- ============================================================ -->
+  <!-- OPTION 3: MinIO (Self-hosted S3-compatible) -->
+  <!-- ============================================================ -->
+  <!--
+    Use this configuration for self-hosted MinIO storage.
+    MinIO is an open-source, S3-compatible object storage server.
+
+    Setup:
+    1. Install MinIO: https://min.io/docs/minio/linux/index.html
+    2. Create access credentials (minioadmin/minioadmin by default)
+    3. Create buckets via MinIO Console or mc client
+    4. Configure the endpoint URL below
+
+    Advantages:
+    - 100% open-source
+    - Self-hosted (no vendor lock-in)
+    - S3-compatible API
+    - Easy to set up with Docker
+  -->
+  <!--
+  <system-properties>
+    <property name="storage.backend" value="s3" />
+
+    <!- - MinIO Configuration - ->
+    <property name="s3.endpoint" value="https://minio.example.com:9000" />
+    <property name="s3.region" value="us-east-1" />  <!- - MinIO supports any region name - ->
+    <property name="s3.access.key" value="minioadmin" />
+    <property name="s3.secret.key" value="minioadmin" />
+    <property name="s3.path.style" value="true" />  <!- - MinIO uses path-style URLs - ->
+
+    <!- - Bucket Configuration - ->
+    <property name="gcs.bucket" value="appinventor-projects" />
+    <property name="gcs.apkbucket" value="appinventor-apks" />
+  </system-properties>
+  -->
+
+
+  <!-- ============================================================ -->
+  <!-- OPTION 4: Wasabi (Low-cost S3-compatible) -->
+  <!-- ============================================================ -->
+  <!--
+    Use this configuration for Wasabi Hot Cloud Storage.
+    Wasabi is a low-cost, S3-compatible storage provider.
+
+    Advantages:
+    - 80% cheaper than AWS S3
+    - S3-compatible API
+    - No egress fees
+  -->
+  <!--
+  <system-properties>
+    <property name="storage.backend" value="s3" />
+
+    <!- - Wasabi Configuration - ->
+    <property name="s3.endpoint" value="https://s3.us-east-1.wasabisys.com" />
+    <property name="s3.region" value="us-east-1" />
+    <property name="s3.access.key" value="YOUR_WASABI_ACCESS_KEY" />
+    <property name="s3.secret.key" value="YOUR_WASABI_SECRET_KEY" />
+    <property name="s3.path.style" value="false" />
+
+    <!- - Bucket Configuration - ->
+    <property name="gcs.bucket" value="appinventor-projects" />
+    <property name="gcs.apkbucket" value="appinventor-apks" />
+  </system-properties>
+  -->
+
+
+  <!-- ============================================================ -->
+  <!-- OPTION 5: Backblaze B2 (via S3-compatible API) -->
+  <!-- ============================================================ -->
+  <!--
+    Use this configuration for Backblaze B2 Cloud Storage.
+
+    Note: Backblaze B2 supports S3-compatible API as of 2020.
+  -->
+  <!--
+  <system-properties>
+    <property name="storage.backend" value="s3" />
+
+    <!- - Backblaze B2 Configuration - ->
+    <property name="s3.endpoint" value="https://s3.us-west-000.backblazeb2.com" />
+    <property name="s3.region" value="us-west-000" />
+    <property name="s3.access.key" value="YOUR_B2_KEY_ID" />
+    <property name="s3.secret.key" value="YOUR_B2_APPLICATION_KEY" />
+    <property name="s3.path.style" value="false" />
+
+    <!- - Bucket Configuration - ->
+    <property name="gcs.bucket" value="appinventor-projects" />
+    <property name="gcs.apkbucket" value="appinventor-apks" />
+  </system-properties>
+  -->
+
+
+  <!-- ============================================================ -->
+  <!-- Other Configuration (same for all backends) -->
+  <!-- ============================================================ -->
+
+  <!-- Redis/Rendezvous Server Configuration (from Phase 1) -->
+  <!--
+  <system-properties>
+    <property name="use.rendezvousserver" value="http://rendezvous.example.com" />
+  </system-properties>
+  -->
+
+  <!-- CloudDB Configuration -->
+  <!--
+  <system-properties>
+    <property name="clouddb.server" value="clouddb.example.com" />
+    <property name="clouddb.uuid.secret" value="changeme!" />
+  </system-properties>
+  -->
+
+  <!-- Build Server Configuration -->
+  <!--
+  <system-properties>
+    <property name="build.server.host" value="localhost:9990" />
+    <property name="build.server.password" value="" />
+  </system-properties>
+  -->
+
+  <!-- Session Configuration -->
+  <!--
+  <system-properties>
+    <property name="session.idletimeout" value="120" />
+    <property name="session.renew" value="30" />
+  </system-properties>
+  -->
+
+</appengine-web-app>
