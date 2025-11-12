@@ -1,0 +1,328 @@
+---
+# Ingress pour MIT App Inventor
+# Expose les services web (App, Rendezvous)
+# RGPD Compliant - Paris DSI
+#
+# NOTE: Utilise NGINX Ingress Controller (ou HAProxy selon préférence DSI)
+# Installation: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/baremetal/deploy.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: appinventor-ingress
+  namespace: appinventor
+  labels:
+    app: appinventor
+    component: ingress
+  annotations:
+    # NGINX Ingress Controller
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # CORS (si nécessaire pour AI Companion)
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://appinventor.dsi.paris.fr"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+
+    # WebSocket support (pour rendezvous)
+    nginx.ingress.kubernetes.io/websocket-services: "rendezvous"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+    # Session affinity (important pour App Inventor)
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "APPINVENTOR_AFFINITY"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "7200"
+    nginx.ingress.kubernetes.io/session-cookie-path: "/"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: "Lax"
+
+    # Limites de taille (pour upload de fichiers projet)
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/client-body-buffer-size: "10m"
+
+    # Timeout pour builds longs
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+
+    # Security headers (RGPD/GDPR compliance)
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Permissions-Policy: geolocation=(self), microphone=(self), camera=(self)";
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains";
+
+    # Rate limiting (protection DDoS)
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+
+    # Certificate Manager (Let's Encrypt ou cert interne DSI)
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"  # Ou votre issuer DSI
+
+spec:
+  ingressClassName: nginx  # Ou "haproxy" selon votre choix
+
+  # TLS Configuration (HTTPS obligatoire)
+  tls:
+    - hosts:
+        - appinventor.dsi.paris.fr
+        - rendezvous.dsi.paris.fr
+      secretName: appinventor-tls-cert
+
+  rules:
+    # ========================================
+    # Application principale App Inventor
+    # ========================================
+    - host: appinventor.dsi.paris.fr
+      http:
+        paths:
+          # Page d'accueil et interface web
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: appinventor
+                port:
+                  number: 8080
+
+          # API endpoints
+          - path: /ode
+            pathType: Prefix
+            backend:
+              service:
+                name: appinventor
+                port:
+                  number: 8080
+
+          # Gallery
+          - path: /gallery
+            pathType: Prefix
+            backend:
+              service:
+                name: appinventor
+                port:
+                  number: 8080
+
+          # Health checks
+          - path: /_ah
+            pathType: Prefix
+            backend:
+              service:
+                name: appinventor
+                port:
+                  number: 8080
+
+    # ========================================
+    # Rendezvous Server (WebRTC)
+    # ========================================
+    - host: rendezvous.dsi.paris.fr
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rendezvous
+                port:
+                  number: 8888
+
+---
+# Certificate (si utilisation de cert-manager)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: appinventor-tls-cert
+  namespace: appinventor
+spec:
+  secretName: appinventor-tls-cert
+  issuerRef:
+    name: letsencrypt-prod  # Ou votre issuer DSI interne
+    kind: ClusterIssuer
+  dnsNames:
+    - appinventor.dsi.paris.fr
+    - rendezvous.dsi.paris.fr
+  # Pour Let's Encrypt
+  # acme:
+  #   config:
+  #     - http01:
+  #         ingressClass: nginx
+  #       domains:
+  #         - appinventor.dsi.paris.fr
+  #         - rendezvous.dsi.paris.fr
+
+---
+# NetworkPolicy - Sécurité réseau (RGPD)
+# Limite l'accès aux services uniquement depuis l'Ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: appinventor-ingress-policy
+  namespace: appinventor
+spec:
+  podSelector:
+    matchLabels:
+      app: appinventor
+      component: webapp
+  policyTypes:
+    - Ingress
+  ingress:
+    # Autoriser Ingress Controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx  # Ou votre namespace ingress
+      ports:
+        - protocol: TCP
+          port: 8080
+
+    # Autoriser depuis autres pods du namespace (inter-service)
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# NetworkPolicy pour Rendezvous
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rendezvous-ingress-policy
+  namespace: appinventor
+spec:
+  podSelector:
+    matchLabels:
+      app: rendezvous
+      component: webrtc
+  policyTypes:
+    - Ingress
+  ingress:
+    # Autoriser Ingress Controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8888
+
+    # Autoriser depuis App Inventor pods
+    - from:
+        - podSelector:
+            matchLabels:
+              app: appinventor
+              component: webapp
+      ports:
+        - protocol: TCP
+          port: 8888
+
+---
+# NetworkPolicy pour Build Server (pas d'accès externe direct)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: buildserver-policy
+  namespace: appinventor
+spec:
+  podSelector:
+    matchLabels:
+      app: buildserver
+      component: builder
+  policyTypes:
+    - Ingress
+  ingress:
+    # Autoriser UNIQUEMENT depuis App Inventor webapp
+    - from:
+        - podSelector:
+            matchLabels:
+              app: appinventor
+              component: webapp
+      ports:
+        - protocol: TCP
+          port: 9990
+
+---
+# Service externe pour debugging (NodePort) - OPTIONNEL
+# À utiliser temporairement pour tests, puis supprimer en production
+apiVersion: v1
+kind: Service
+metadata:
+  name: appinventor-nodeport
+  namespace: appinventor
+  labels:
+    app: appinventor
+    component: webapp-external
+  annotations:
+    description: "Service NodePort temporaire pour tests - À SUPPRIMER EN PRODUCTION"
+spec:
+  type: NodePort
+  ports:
+    - port: 8080
+      nodePort: 30080  # Accessible sur http://<node-ip>:30080
+      name: http
+      protocol: TCP
+  selector:
+    app: appinventor
+    component: webapp
+
+---
+# ConfigMap pour page de maintenance (optionnel)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maintenance-page
+  namespace: appinventor
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>MIT App Inventor - Maintenance</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+                text-align: center;
+            }
+            .container {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 3rem;
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+            }
+            h1 {
+                font-size: 3rem;
+                margin-bottom: 1rem;
+            }
+            p {
+                font-size: 1.2rem;
+                margin-bottom: 2rem;
+            }
+            .logo {
+                width: 150px;
+                margin-bottom: 2rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔧 Maintenance en cours</h1>
+            <p>MIT App Inventor est temporairement indisponible pour maintenance.</p>
+            <p>Nous serons de retour très bientôt.</p>
+            <p><small>DSI Paris - RGPD Compliant</small></p>
+        </div>
+    </body>
+    </html>

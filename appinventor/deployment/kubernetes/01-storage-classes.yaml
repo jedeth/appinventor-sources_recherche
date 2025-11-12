@@ -1,0 +1,222 @@
+---
+# Storage Classes pour différents types de stockage
+# Adapté pour infrastructure on-premise avec disques locaux
+
+# Storage Class pour PostgreSQL (SSD NVMe haute performance)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  labels:
+    type: ssd-nvme
+provisioner: kubernetes.io/no-provisioner  # Local storage
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+
+---
+# Storage Class pour MinIO (HDD RAID pour capacité)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bulk-storage
+  labels:
+    type: hdd-raid
+provisioner: kubernetes.io/no-provisioner  # Local storage
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+
+---
+# Persistent Volumes pour PostgreSQL (à créer sur chaque node)
+# Node 1 - Primary
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-pv-0
+  labels:
+    type: fast-ssd
+    component: postgresql
+spec:
+  capacity:
+    storage: 500Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fast-ssd
+  local:
+    path: /mnt/ssd-nvme/postgresql-0  # À créer sur votre serveur
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-1  # REMPLACER par le nom réel de votre node
+
+---
+# Node 2 - Replica 1
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-pv-1
+  labels:
+    type: fast-ssd
+    component: postgresql
+spec:
+  capacity:
+    storage: 500Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fast-ssd
+  local:
+    path: /mnt/ssd-nvme/postgresql-1
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-2  # REMPLACER
+
+---
+# Node 3 - Replica 2
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgresql-pv-2
+  labels:
+    type: fast-ssd
+    component: postgresql
+spec:
+  capacity:
+    storage: 500Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fast-ssd
+  local:
+    path: /mnt/ssd-nvme/postgresql-2
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-3  # REMPLACER
+
+---
+# Persistent Volumes pour MinIO (4 nodes minimum)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-pv-0
+  labels:
+    type: bulk-storage
+    component: minio
+spec:
+  capacity:
+    storage: 2Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bulk-storage
+  local:
+    path: /mnt/hdd-raid/minio-0  # À créer sur votre serveur
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-1
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-pv-1
+  labels:
+    type: bulk-storage
+    component: minio
+spec:
+  capacity:
+    storage: 2Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bulk-storage
+  local:
+    path: /mnt/hdd-raid/minio-1
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-2
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-pv-2
+  labels:
+    type: bulk-storage
+    component: minio
+spec:
+  capacity:
+    storage: 2Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bulk-storage
+  local:
+    path: /mnt/hdd-raid/minio-2
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-3
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minio-pv-3
+  labels:
+    type: bulk-storage
+    component: minio
+spec:
+  capacity:
+    storage: 2Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bulk-storage
+  local:
+    path: /mnt/hdd-raid/minio-3
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - your-node-4  # Ou utiliser node-1 si seulement 3 nodes

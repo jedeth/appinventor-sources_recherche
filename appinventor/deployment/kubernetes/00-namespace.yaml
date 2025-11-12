@@ -1,0 +1,13 @@
+---
+# Namespace pour MIT App Inventor
+# Isole toutes les ressources dans un namespace dédié
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appinventor
+  labels:
+    name: appinventor
+    environment: production
+    compliance: rgpd
+    location: paris-dsi
+    managed-by: dsi-team

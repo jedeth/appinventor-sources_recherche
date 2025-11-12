@@ -1,0 +1,994 @@
+---
+# PostgreSQL avec Patroni pour Haute Disponibilité
+# Remplace Google Datastore (Phase 4)
+# RGPD Compliant - Données stockées à Paris DSI uniquement
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-headless
+  namespace: appinventor
+  labels:
+    app: postgresql
+    component: database
+spec:
+  clusterIP: None  # Headless service pour StatefulSet
+  ports:
+    - port: 5432
+      name: postgresql
+      protocol: TCP
+    - port: 8008
+      name: patroni
+      protocol: TCP
+  selector:
+    app: postgresql
+  publishNotReadyAddresses: true
+
+---
+# Service pour accès lecture seule (réplicas)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-replicas
+  namespace: appinventor
+  labels:
+    app: postgresql
+    component: database
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      name: postgresql
+      protocol: TCP
+  selector:
+    app: postgresql
+    role: replica
+
+---
+# Service pour accès au master
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: appinventor
+  labels:
+    app: postgresql
+    component: database
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      name: postgresql
+      protocol: TCP
+  selector:
+    app: postgresql
+    role: master
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: appinventor
+  labels:
+    app: postgresql
+    component: database
+    compliance: rgpd
+spec:
+  serviceName: postgresql-headless
+  replicas: 3  # 1 master + 2 réplicas pour HA
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+        component: database
+    spec:
+      # Anti-affinity pour distribuer les pods sur différents nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - postgresql
+                topologyKey: kubernetes.io/hostname
+
+      # Init container pour configuration initiale
+      initContainers:
+        - name: init-permissions
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              chown -R 999:999 /var/lib/postgresql/data
+              chmod 700 /var/lib/postgresql/data
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          securityContext:
+            runAsUser: 0
+
+      containers:
+        - name: postgresql
+          image: registry.opensource.zalan.do/acid/spilo-15:3.0-p1  # PostgreSQL 15 + Patroni
+
+          env:
+            # Patroni/Cluster configuration
+            - name: SCOPE
+              value: "appinventor-postgres"
+
+            - name: PGVERSION
+              value: "15"
+
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+            # PostgreSQL superuser credentials
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: superuser-name
+
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: superuser-password
+
+            # App Inventor database and user
+            - name: APPINVENTOR_DB
+              value: "appinventor"
+
+            - name: APPINVENTOR_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: appinventor-user
+
+            - name: APPINVENTOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: appinventor-password
+
+            # DCS (etcd-like) - utiliser Kubernetes API pour consensus
+            - name: KUBERNETES_USE_CONFIGMAPS
+              value: "true"
+
+            - name: KUBERNETES_LABELS
+              value: "app=postgresql"
+
+            # Configuration PostgreSQL optimisée pour 512GB RAM
+            # (environ 128GB alloués par pod si 3 pods + autres services)
+            - name: POSTGRESQL_MAX_CONNECTIONS
+              value: "500"
+
+            - name: POSTGRESQL_SHARED_BUFFERS
+              value: "32GB"  # 25% de RAM allouée
+
+            - name: POSTGRESQL_EFFECTIVE_CACHE_SIZE
+              value: "96GB"  # 75% de RAM allouée
+
+            - name: POSTGRESQL_MAINTENANCE_WORK_MEM
+              value: "2GB"
+
+            - name: POSTGRESQL_WORK_MEM
+              value: "64MB"
+
+            - name: POSTGRESQL_WAL_BUFFERS
+              value: "16MB"
+
+            - name: POSTGRESQL_DEFAULT_STATISTICS_TARGET
+              value: "100"
+
+            - name: POSTGRESQL_RANDOM_PAGE_COST
+              value: "1.1"  # SSD
+
+            - name: POSTGRESQL_EFFECTIVE_IO_CONCURRENCY
+              value: "200"  # SSD
+
+            - name: POSTGRESQL_MAX_WORKER_PROCESSES
+              value: "16"
+
+            - name: POSTGRESQL_MAX_PARALLEL_WORKERS_PER_GATHER
+              value: "4"
+
+            - name: POSTGRESQL_MAX_PARALLEL_WORKERS
+              value: "16"
+
+            - name: POSTGRESQL_MAX_PARALLEL_MAINTENANCE_WORKERS
+              value: "4"
+
+            # WAL configuration pour performance et sécurité
+            - name: POSTGRESQL_WAL_LEVEL
+              value: "replica"
+
+            - name: POSTGRESQL_MAX_WAL_SIZE
+              value: "4GB"
+
+            - name: POSTGRESQL_MIN_WAL_SIZE
+              value: "1GB"
+
+            - name: POSTGRESQL_WAL_COMPRESSION
+              value: "on"
+
+            # Réplication
+            - name: POSTGRESQL_MAX_WAL_SENDERS
+              value: "10"
+
+            - name: POSTGRESQL_MAX_REPLICATION_SLOTS
+              value: "10"
+
+            # Checkpoint configuration
+            - name: POSTGRESQL_CHECKPOINT_COMPLETION_TARGET
+              value: "0.9"
+
+            - name: POSTGRESQL_CHECKPOINT_TIMEOUT
+              value: "15min"
+
+            # Logging (RGPD: pas de données sensibles dans les logs)
+            - name: POSTGRESQL_LOG_LINE_PREFIX
+              value: "%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h "
+
+            - name: POSTGRESQL_LOG_STATEMENT
+              value: "ddl"  # Log DDL uniquement, pas les données
+
+            - name: POSTGRESQL_LOG_MIN_DURATION_STATEMENT
+              value: "1000"  # Log queries > 1s
+
+            # Locale française (RGPD compliance)
+            - name: LC_ALL
+              value: "fr_FR.UTF-8"
+
+            - name: LANG
+              value: "fr_FR.UTF-8"
+
+          ports:
+            - containerPort: 5432
+              name: postgresql
+              protocol: TCP
+            - containerPort: 8008
+              name: patroni
+              protocol: TCP
+
+          # Health checks via Patroni
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 8008
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8008
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Ressources (optimisées pour votre hardware)
+          resources:
+            requests:
+              memory: "128Gi"  # ~1/3 de 512GB (avec marge pour OS et autres services)
+              cpu: "16000m"    # ~1/3 de 72 cores
+            limits:
+              memory: "128Gi"
+              cpu: "24000m"    # Peut burst jusqu'à 24 cores
+
+          # Volume mounts
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: patroni-config
+              mountPath: /etc/patroni
+              readOnly: true
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+      # Volumes
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgresql-init-scripts
+        - name: patroni-config
+          configMap:
+            name: patroni-config
+
+  # Volume Claim Templates
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: postgresql
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: fast-ssd  # SSD NVMe pour performance
+        resources:
+          requests:
+            storage: 500Gi  # À ajuster selon vos besoins
+
+---
+# ConfigMap pour scripts d'initialisation PostgreSQL
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-init-scripts
+  namespace: appinventor
+data:
+  01-init-database.sql: |
+    -- MIT App Inventor Database Schema
+    -- Remplace Google Datastore (Phase 4 Migration)
+    -- RGPD Compliant - Paris DSI uniquement
+
+    -- Créer la base de données appinventor si elle n'existe pas
+    -- (géré par variable d'environnement APPINVENTOR_DB)
+
+    -- Extensions nécessaires
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- Pour recherche full-text
+
+    -- ==================================================================
+    -- Table: users
+    -- Remplace: UserData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(255) PRIMARY KEY,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        email_lower VARCHAR(255) GENERATED ALWAYS AS (LOWER(email)) STORED,  -- Index case-insensitive
+        repository_id BIGINT,
+        is_admin BOOLEAN DEFAULT FALSE,
+        user_link TEXT,
+
+        -- User settings (JSON)
+        settings JSONB DEFAULT '{}'::jsonb,
+
+        -- TOS acceptance
+        tos_accepted BOOLEAN DEFAULT FALSE,
+
+        -- Session information
+        session_id VARCHAR(255),
+        session_start_timestamp BIGINT,
+
+        -- Dernière connexion
+        last_login TIMESTAMP WITH TIME ZONE,
+
+        -- Métadonnées
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+        -- RGPD: champs pour gestion des données personnelles
+        consent_date TIMESTAMP WITH TIME ZONE,
+        data_retention_until TIMESTAMP WITH TIME ZONE,
+
+        CONSTRAINT users_email_check CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(email_lower);
+    CREATE INDEX IF NOT EXISTS idx_users_session ON users(session_id) WHERE session_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_users_last_login ON users(last_login);
+
+    -- ==================================================================
+    -- Table: projects
+    -- Remplace: ProjectData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id BIGINT PRIMARY KEY,
+        project_name VARCHAR(255) NOT NULL,
+        project_type VARCHAR(50) NOT NULL DEFAULT 'Project',
+        owner_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+        -- Settings (JSON)
+        settings JSONB DEFAULT '{}'::jsonb,
+
+        -- Métadonnées de date (millisecondes depuis epoch)
+        date_created BIGINT NOT NULL,
+        date_modified BIGINT NOT NULL,
+
+        -- Attribution (MIT AI2 Timestamp token)
+        attribution_id VARCHAR(255),
+
+        -- Métadonnées
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_projects_date_modified ON projects(date_modified DESC);
+    CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name);
+    CREATE INDEX IF NOT EXISTS idx_projects_attribution ON projects(attribution_id) WHERE attribution_id IS NOT NULL;
+
+    -- ==================================================================
+    -- Table: user_projects (relation many-to-many)
+    -- Remplace: UserProjectData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS user_projects (
+        id BIGSERIAL PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        project_id BIGINT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+
+        -- État du projet pour cet utilisateur
+        state INTEGER DEFAULT 0,
+
+        -- Métadonnées
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+        UNIQUE(user_id, project_id)
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_user_projects_user ON user_projects(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_projects_project ON user_projects(project_id);
+
+    -- ==================================================================
+    -- Table: file_data
+    -- Remplace: FileData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS file_data (
+        id BIGSERIAL PRIMARY KEY,
+        file_name VARCHAR(500) NOT NULL,
+        project_id BIGINT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+
+        -- Contenu du fichier (peut être volumineux)
+        -- Pour les très gros fichiers, utiliser MinIO et stocker seulement la référence
+        content BYTEA,
+
+        -- Si le fichier est dans MinIO
+        storage_location VARCHAR(50) DEFAULT 'database',  -- 'database' ou 'minio'
+        minio_key TEXT,  -- Chemin dans MinIO si storage_location='minio'
+
+        -- Métadonnées
+        file_size BIGINT,
+        role VARCHAR(50),  -- 'source', 'target', etc.
+        is_blob_file BOOLEAN DEFAULT FALSE,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+        CONSTRAINT file_data_storage_check CHECK (
+            (storage_location = 'database' AND content IS NOT NULL) OR
+            (storage_location = 'minio' AND minio_key IS NOT NULL)
+        )
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_file_data_project ON file_data(project_id);
+    CREATE INDEX IF NOT EXISTS idx_file_data_name ON file_data(project_id, file_name);
+    CREATE INDEX IF NOT EXISTS idx_file_data_role ON file_data(project_id, role);
+
+    -- ==================================================================
+    -- Table: deferred_file_data
+    -- Remplace: DeferredFileData.java (pour compilation asynchrone)
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS deferred_file_data (
+        id BIGSERIAL PRIMARY KEY,
+        project_id BIGINT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        file_name VARCHAR(500) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+        -- Contenu différé
+        content BYTEA,
+
+        -- État du traitement
+        status VARCHAR(50) DEFAULT 'pending',  -- 'pending', 'processing', 'completed', 'failed'
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_deferred_file_project ON deferred_file_data(project_id);
+    CREATE INDEX IF NOT EXISTS idx_deferred_file_status ON deferred_file_data(status) WHERE status IN ('pending', 'processing');
+
+    -- ==================================================================
+    -- Table: project_comments
+    -- Remplace: ProjectCommentsData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS project_comments (
+        id BIGSERIAL PRIMARY KEY,
+        project_id BIGINT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+
+        -- Commentaire
+        comment TEXT NOT NULL,
+
+        -- Auteur
+        author_id VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+        author_name VARCHAR(255),
+
+        -- Date (millisecondes depuis epoch)
+        timestamp BIGINT NOT NULL,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_project_comments_project ON project_comments(project_id);
+    CREATE INDEX IF NOT EXISTS idx_project_comments_timestamp ON project_comments(timestamp DESC);
+
+    -- ==================================================================
+    -- Table: galleries
+    -- Remplace: GalleryAppData.java (app listings)
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS galleries (
+        gallery_id BIGSERIAL PRIMARY KEY,
+        app_name VARCHAR(255) NOT NULL,
+        app_description TEXT,
+
+        -- Projet source
+        source_project_id BIGINT REFERENCES projects(project_id) ON DELETE SET NULL,
+
+        -- Auteur
+        developer_id VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+        developer_name VARCHAR(255),
+        developer_email VARCHAR(255),
+
+        -- Métadonnées
+        app_created BIGINT NOT NULL,
+        app_published BIGINT NOT NULL,
+
+        -- État de publication
+        status VARCHAR(50) DEFAULT 'published',  -- 'draft', 'published', 'moderated', 'removed'
+
+        -- Image et fichiers
+        app_image_url TEXT,
+        app_source_url TEXT,
+
+        -- Statistiques
+        downloads INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        views INTEGER DEFAULT 0,
+
+        -- Tags et catégories
+        tags TEXT[],
+        category VARCHAR(100),
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance et recherche
+    CREATE INDEX IF NOT EXISTS idx_galleries_status ON galleries(status);
+    CREATE INDEX IF NOT EXISTS idx_galleries_developer ON galleries(developer_id);
+    CREATE INDEX IF NOT EXISTS idx_galleries_published ON galleries(app_published DESC);
+    CREATE INDEX IF NOT EXISTS idx_galleries_downloads ON galleries(downloads DESC);
+    CREATE INDEX IF NOT EXISTS idx_galleries_likes ON galleries(likes DESC);
+    CREATE INDEX IF NOT EXISTS idx_galleries_name_trgm ON galleries USING gin(app_name gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_galleries_tags ON galleries USING gin(tags);
+
+    -- ==================================================================
+    -- Table: gallery_apps (relation avec projets utilisateur)
+    -- Remplace: GalleryAppListData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS gallery_apps (
+        id BIGSERIAL PRIMARY KEY,
+        gallery_id BIGINT NOT NULL REFERENCES galleries(gallery_id) ON DELETE CASCADE,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+        -- Métadonnées
+        added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+        UNIQUE(gallery_id, user_id)
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_gallery_apps_user ON gallery_apps(user_id);
+    CREATE INDEX IF NOT EXISTS idx_gallery_apps_gallery ON gallery_apps(gallery_id);
+
+    -- ==================================================================
+    -- Table: gallery_comments
+    -- Remplace: GalleryCommentData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS gallery_comments (
+        comment_id BIGSERIAL PRIMARY KEY,
+        gallery_id BIGINT NOT NULL REFERENCES galleries(gallery_id) ON DELETE CASCADE,
+
+        -- Commentaire
+        comment TEXT NOT NULL,
+
+        -- Auteur
+        author_id VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+        author_name VARCHAR(255),
+
+        -- Date (millisecondes depuis epoch)
+        timestamp BIGINT NOT NULL,
+
+        -- Modération
+        is_moderated BOOLEAN DEFAULT FALSE,
+        moderation_reason TEXT,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_gallery_comments_gallery ON gallery_comments(gallery_id);
+    CREATE INDEX IF NOT EXISTS idx_gallery_comments_timestamp ON gallery_comments(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_gallery_comments_moderated ON gallery_comments(is_moderated);
+
+    -- ==================================================================
+    -- Table: gallery_reports
+    -- Remplace: GalleryAppReportData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS gallery_reports (
+        report_id BIGSERIAL PRIMARY KEY,
+        gallery_id BIGINT NOT NULL REFERENCES galleries(gallery_id) ON DELETE CASCADE,
+
+        -- Signalement
+        report_text TEXT NOT NULL,
+
+        -- Auteur du signalement
+        reporter_id VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+
+        -- Date (millisecondes depuis epoch)
+        timestamp BIGINT NOT NULL,
+
+        -- État du traitement
+        status VARCHAR(50) DEFAULT 'pending',  -- 'pending', 'reviewed', 'action_taken', 'dismissed'
+        resolution_notes TEXT,
+        resolved_by VARCHAR(255) REFERENCES users(id) ON DELETE SET NULL,
+        resolved_at TIMESTAMP WITH TIME ZONE,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_gallery_reports_gallery ON gallery_reports(gallery_id);
+    CREATE INDEX IF NOT EXISTS idx_gallery_reports_status ON gallery_reports(status);
+    CREATE INDEX IF NOT EXISTS idx_gallery_reports_timestamp ON gallery_reports(timestamp DESC);
+
+    -- ==================================================================
+    -- Table: gallery_moderation_actions
+    -- Remplace: GalleryModerationAction.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS gallery_moderation_actions (
+        action_id BIGSERIAL PRIMARY KEY,
+        gallery_id BIGINT REFERENCES galleries(gallery_id) ON DELETE CASCADE,
+        report_id BIGINT REFERENCES gallery_reports(report_id) ON DELETE CASCADE,
+
+        -- Action
+        action_type VARCHAR(50) NOT NULL,  -- 'warning', 'suspend', 'remove', 'ban_user'
+        reason TEXT NOT NULL,
+
+        -- Modérateur
+        moderator_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+        -- Date (millisecondes depuis epoch)
+        timestamp BIGINT NOT NULL,
+
+        -- Métadonnées
+        email_sent BOOLEAN DEFAULT FALSE,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_moderation_gallery ON gallery_moderation_actions(gallery_id);
+    CREATE INDEX IF NOT EXISTS idx_moderation_moderator ON gallery_moderation_actions(moderator_id);
+    CREATE INDEX IF NOT EXISTS idx_moderation_timestamp ON gallery_moderation_actions(timestamp DESC);
+
+    -- ==================================================================
+    -- Table: user_files
+    -- Remplace: UserFileData.java (fichiers utilisateur génériques)
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS user_files (
+        id BIGSERIAL PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        file_name VARCHAR(500) NOT NULL,
+
+        -- Contenu ou référence MinIO
+        content BYTEA,
+        storage_location VARCHAR(50) DEFAULT 'database',
+        minio_key TEXT,
+
+        -- Métadonnées
+        file_size BIGINT,
+        mime_type VARCHAR(100),
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+        UNIQUE(user_id, file_name)
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_user_files_user ON user_files(user_id);
+
+    -- ==================================================================
+    -- Table: backpack
+    -- Remplace: BackpackData.java (fonctionnalité "sac à dos")
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS backpack (
+        id BIGSERIAL PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+        -- Contenu du backpack (JSON)
+        content JSONB NOT NULL,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_backpack_user ON backpack(user_id);
+    CREATE INDEX IF NOT EXISTS idx_backpack_content ON backpack USING gin(content);
+
+    -- ==================================================================
+    -- Table: motd (Message of the Day)
+    -- Remplace: MotdData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS motd (
+        id BIGSERIAL PRIMARY KEY,
+
+        -- Message
+        caption TEXT NOT NULL,
+        more_info_url TEXT,
+
+        -- Période d'affichage (millisecondes depuis epoch)
+        start_date BIGINT NOT NULL,
+        end_date BIGINT NOT NULL,
+
+        -- Actif ou non
+        is_active BOOLEAN DEFAULT TRUE,
+
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour performance
+    CREATE INDEX IF NOT EXISTS idx_motd_active ON motd(is_active, start_date, end_date);
+
+    -- ==================================================================
+    -- Table: nonce (pour sécurité anti-CSRF)
+    -- Remplace: NonceData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS nonce (
+        nonce VARCHAR(255) PRIMARY KEY,
+        timestamp BIGINT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Index pour nettoyage (supprimer les vieux nonces)
+    CREATE INDEX IF NOT EXISTS idx_nonce_timestamp ON nonce(timestamp);
+
+    -- ==================================================================
+    -- Table: whitelist (pour contrôle d'accès)
+    -- Remplace: WhitelistData.java
+    -- ==================================================================
+    CREATE TABLE IF NOT EXISTS whitelist (
+        email_lower VARCHAR(255) PRIMARY KEY,  -- Toujours en minuscules
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- ==================================================================
+    -- Triggers pour updated_at automatique
+    -- ==================================================================
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    $$ language 'plpgsql';
+
+    -- Appliquer le trigger aux tables avec updated_at
+    DO $$
+    DECLARE
+        t text;
+    BEGIN
+        FOR t IN
+            SELECT tablename FROM pg_tables
+            WHERE schemaname = 'public'
+            AND tablename IN ('users', 'projects', 'user_projects', 'file_data', 'deferred_file_data',
+                             'galleries', 'user_files', 'backpack', 'motd')
+        LOOP
+            EXECUTE format('
+                DROP TRIGGER IF EXISTS update_%I_updated_at ON %I;
+                CREATE TRIGGER update_%I_updated_at
+                BEFORE UPDATE ON %I
+                FOR EACH ROW
+                EXECUTE FUNCTION update_updated_at_column();
+            ', t, t, t, t);
+        END LOOP;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==================================================================
+    -- Vues utiles pour monitoring et statistiques
+    -- ==================================================================
+
+    -- Vue: statistiques utilisateurs
+    CREATE OR REPLACE VIEW user_stats AS
+    SELECT
+        u.id,
+        u.email,
+        COUNT(DISTINCT p.project_id) as project_count,
+        COUNT(DISTINCT ga.gallery_id) as gallery_app_count,
+        MAX(p.date_modified) as last_project_activity
+    FROM users u
+    LEFT JOIN projects p ON p.owner_id = u.id
+    LEFT JOIN gallery_apps ga ON ga.user_id = u.id
+    GROUP BY u.id, u.email;
+
+    -- Vue: statistiques projets
+    CREATE OR REPLACE VIEW project_stats AS
+    SELECT
+        p.project_id,
+        p.project_name,
+        p.owner_id,
+        COUNT(DISTINCT fd.id) as file_count,
+        SUM(fd.file_size) as total_size,
+        COUNT(DISTINCT pc.id) as comment_count
+    FROM projects p
+    LEFT JOIN file_data fd ON fd.project_id = p.project_id
+    LEFT JOIN project_comments pc ON pc.project_id = p.project_id
+    GROUP BY p.project_id, p.project_name, p.owner_id;
+
+    -- Vue: galerie populaire
+    CREATE OR REPLACE VIEW popular_gallery_apps AS
+    SELECT
+        g.*,
+        COUNT(DISTINCT gc.comment_id) as comment_count
+    FROM galleries g
+    LEFT JOIN gallery_comments gc ON gc.gallery_id = g.gallery_id
+    WHERE g.status = 'published'
+    GROUP BY g.gallery_id
+    ORDER BY g.downloads DESC, g.likes DESC, g.views DESC;
+
+    -- ==================================================================
+    -- Fonction de nettoyage automatique (RGPD)
+    -- ==================================================================
+    CREATE OR REPLACE FUNCTION cleanup_old_data()
+    RETURNS void AS $$
+    BEGIN
+        -- Supprimer les vieux nonces (> 24h)
+        DELETE FROM nonce
+        WHERE timestamp < EXTRACT(EPOCH FROM NOW() - INTERVAL '24 hours') * 1000;
+
+        -- Supprimer les utilisateurs dont la rétention est expirée (RGPD)
+        DELETE FROM users
+        WHERE data_retention_until IS NOT NULL
+        AND data_retention_until < CURRENT_TIMESTAMP;
+
+        -- Supprimer les fichiers différés traités (> 7 jours)
+        DELETE FROM deferred_file_data
+        WHERE status = 'completed'
+        AND updated_at < CURRENT_TIMESTAMP - INTERVAL '7 days';
+
+        RAISE NOTICE 'Cleanup completed at %', CURRENT_TIMESTAMP;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==================================================================
+    -- Grants pour utilisateur appinventor
+    -- ==================================================================
+    -- (Sera exécuté automatiquement par Spilo/Patroni via APPINVENTOR_USER)
+
+    GRANT CONNECT ON DATABASE appinventor TO appinventor_user;
+    GRANT USAGE ON SCHEMA public TO appinventor_user;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO appinventor_user;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO appinventor_user;
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO appinventor_user;
+
+    -- Permissions sur les futures tables
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO appinventor_user;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO appinventor_user;
+
+    -- ==================================================================
+    -- Statistiques finales
+    -- ==================================================================
+    DO $$
+    BEGIN
+        RAISE NOTICE '========================================';
+        RAISE NOTICE 'MIT App Inventor Database Schema Created';
+        RAISE NOTICE '========================================';
+        RAISE NOTICE 'Phase 4 Migration - Google Datastore Replacement';
+        RAISE NOTICE 'RGPD Compliant - Paris DSI';
+        RAISE NOTICE '';
+        RAISE NOTICE 'Tables created: 16';
+        RAISE NOTICE 'Views created: 3';
+        RAISE NOTICE 'Functions created: 2';
+        RAISE NOTICE '';
+        RAISE NOTICE 'Ready for App Inventor deployment!';
+        RAISE NOTICE '========================================';
+    END;
+    $$ LANGUAGE plpgsql;
+
+---
+# ConfigMap pour configuration Patroni personnalisée
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: patroni-config
+  namespace: appinventor
+data:
+  patroni.yaml: |
+    bootstrap:
+      dcs:
+        ttl: 30
+        loop_wait: 10
+        retry_timeout: 10
+        maximum_lag_on_failover: 1048576
+        postgresql:
+          use_pg_rewind: true
+          parameters:
+            # Timezone française (RGPD)
+            timezone: 'Europe/Paris'
+
+            # Encoding UTF-8
+            client_encoding: 'UTF8'
+
+            # Connection settings
+            max_connections: 500
+            superuser_reserved_connections: 5
+
+            # Logging (sans données sensibles - RGPD)
+            log_destination: 'stderr'
+            logging_collector: on
+            log_directory: '/var/log/postgresql'
+            log_filename: 'postgresql-%Y-%m-%d.log'
+            log_rotation_age: '1d'
+            log_rotation_size: '100MB'
+            log_min_duration_statement: 1000
+            log_line_prefix: '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+            log_statement: 'ddl'
+
+            # Autovacuum (important pour performance)
+            autovacuum: on
+            autovacuum_max_workers: 4
+            autovacuum_naptime: '30s'
+
+      initdb:
+        - encoding: UTF8
+        - locale: fr_FR.UTF-8
+        - data-checksums
+
+      pg_hba:
+        - local all all trust
+        - host all all 0.0.0.0/0 md5
+        - host replication replicator 0.0.0.0/0 md5
+
+    restapi:
+      listen: 0.0.0.0:8008
+      connect_address: ${POD_IP}:8008

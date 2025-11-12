@@ -1,0 +1,553 @@
+---
+# Redis avec Sentinel pour Haute Disponibilité
+# Remplace Google Memcache + Session Storage
+# RGPD Compliant - Données en mémoire uniquement à Paris DSI
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: appinventor
+data:
+  redis.conf: |
+    # Redis Configuration pour MIT App Inventor
+    # Optimisé pour 512GB RAM (allocation ~16GB par pod Redis)
+
+    # Network
+    bind 0.0.0.0
+    port 6379
+    protected-mode no
+    tcp-backlog 511
+    timeout 0
+    tcp-keepalive 300
+
+    # General
+    daemonize no
+    supervised no
+    pidfile /var/run/redis.pid
+    loglevel notice
+    logfile ""
+
+    # Snapshotting (RDB persistence)
+    # Pour session storage, on active la persistence
+    save 900 1      # Au moins 1 changement en 15 minutes
+    save 300 10     # Au moins 10 changements en 5 minutes
+    save 60 10000   # Au moins 10000 changements en 1 minute
+
+    stop-writes-on-bgsave-error yes
+    rdbcompression yes
+    rdbchecksum yes
+    dbfilename dump.rdb
+    dir /data
+
+    # Replication
+    replica-serve-stale-data yes
+    replica-read-only yes
+    repl-diskless-sync no
+    repl-diskless-sync-delay 5
+    repl-disable-tcp-nodelay no
+    replica-priority 100
+
+    # Security
+    # Password sera injecté via environnement (requirepass)
+    # NO dangerous commands
+    rename-command FLUSHDB ""
+    rename-command FLUSHALL ""
+    rename-command KEYS ""
+    rename-command CONFIG ""
+
+    # Limits
+    maxclients 10000
+    maxmemory 14gb  # ~14GB par pod (avec marge)
+    maxmemory-policy allkeys-lru  # Éviction LRU pour cache
+
+    # Append Only File (AOF) - disabled car RDB suffit
+    appendonly no
+
+    # Lua scripting
+    lua-time-limit 5000
+
+    # Slow log
+    slowlog-log-slower-than 10000  # 10ms
+    slowlog-max-len 128
+
+    # Latency monitoring
+    latency-monitor-threshold 100  # 100ms
+
+    # Event notification (pour Sentinel)
+    notify-keyspace-events ""
+
+    # Advanced config
+    hash-max-ziplist-entries 512
+    hash-max-ziplist-value 64
+    list-max-ziplist-size -2
+    set-max-intset-entries 512
+    zset-max-ziplist-entries 128
+    zset-max-ziplist-value 64
+    hll-sparse-max-bytes 3000
+    activerehashing yes
+    client-output-buffer-limit normal 0 0 0
+    client-output-buffer-limit replica 256mb 64mb 60
+    client-output-buffer-limit pubsub 32mb 8mb 60
+    hz 10
+    aof-rewrite-incremental-fsync yes
+
+  sentinel.conf: |
+    # Redis Sentinel Configuration
+    port 26379
+    dir /data
+
+    # Monitoring
+    # sentinel monitor <master-name> <ip> <port> <quorum>
+    # Sera configuré dynamiquement par le script d'init
+    sentinel monitor appinventor-redis redis-0.redis-headless.appinventor.svc.cluster.local 6379 2
+
+    # Timeouts
+    sentinel down-after-milliseconds appinventor-redis 5000
+    sentinel parallel-syncs appinventor-redis 1
+    sentinel failover-timeout appinventor-redis 10000
+
+    # Notification (optionnel)
+    # sentinel notification-script appinventor-redis /path/to/script.sh
+
+    # Deny dangerous commands
+    sentinel deny-scripts-reconfig yes
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: appinventor
+  labels:
+    app: redis
+    component: cache
+spec:
+  clusterIP: None  # Headless service
+  ports:
+    - port: 6379
+      name: redis
+      protocol: TCP
+    - port: 26379
+      name: sentinel
+      protocol: TCP
+  selector:
+    app: redis
+  publishNotReadyAddresses: true
+
+---
+# Service pour accès au master Redis (via Sentinel)
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: appinventor
+  labels:
+    app: redis
+    component: cache
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6379
+      name: redis
+      protocol: TCP
+      targetPort: 6379
+  selector:
+    app: redis
+
+---
+# Service pour Sentinel
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: appinventor
+  labels:
+    app: redis
+    component: sentinel
+spec:
+  type: ClusterIP
+  ports:
+    - port: 26379
+      name: sentinel
+      protocol: TCP
+      targetPort: 26379
+  selector:
+    app: redis
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: appinventor
+  labels:
+    app: redis
+    component: cache
+    compliance: rgpd
+spec:
+  serviceName: redis-headless
+  replicas: 3  # 3 nodes pour HA
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: cache
+    spec:
+      # Anti-affinity pour distribuer les pods
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - redis
+                topologyKey: kubernetes.io/hostname
+
+      # Init container pour configuration
+      initContainers:
+        - name: init-redis
+          image: redis:7.2-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -ex
+              # Copier la config
+              cp /mnt/config/redis.conf /etc/redis/redis.conf
+              cp /mnt/config/sentinel.conf /etc/redis/sentinel.conf
+
+              # Configurer le mot de passe Redis
+              echo "requirepass $REDIS_PASSWORD" >> /etc/redis/redis.conf
+              echo "masterauth $REDIS_PASSWORD" >> /etc/redis/redis.conf
+
+              # Configurer Sentinel
+              echo "sentinel auth-pass appinventor-redis $REDIS_PASSWORD" >> /etc/redis/sentinel.conf
+
+              # Permissions
+              chown -R redis:redis /etc/redis /data
+              chmod 600 /etc/redis/*.conf
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+          volumeMounts:
+            - name: config
+              mountPath: /mnt/config
+            - name: redis-config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+          securityContext:
+            runAsUser: 0  # Need root for chown
+
+      containers:
+        # Container Redis principal
+        - name: redis
+          image: redis:7.2-alpine
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 6379
+              name: redis
+              protocol: TCP
+
+          # Health checks
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  redis-cli -a $REDIS_PASSWORD ping | grep PONG
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  redis-cli -a $REDIS_PASSWORD ping | grep PONG
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Ressources
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "2000m"
+            limits:
+              memory: "16Gi"
+              cpu: "4000m"
+
+          # Volumes
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+        # Container Sentinel (monitoring et failover)
+        - name: sentinel
+          image: redis:7.2-alpine
+          command:
+            - redis-sentinel
+            - /etc/redis/sentinel.conf
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 26379
+              name: sentinel
+              protocol: TCP
+
+          # Health checks
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -p 26379 ping | grep PONG
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -p 26379 ping | grep PONG
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Ressources (Sentinel est léger)
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+          # Volumes
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+      # Volumes
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+
+        - name: redis-config
+          emptyDir: {}
+
+  # Volume Claim Templates
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: redis
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: fast-ssd  # SSD pour performance
+        resources:
+          requests:
+            storage: 50Gi  # RDB snapshots + AOF (si activé)
+
+---
+# Job pour initialiser le cluster Redis avec Sentinel
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-init
+  namespace: appinventor
+  labels:
+    app: redis
+    component: init
+spec:
+  template:
+    metadata:
+      labels:
+        app: redis-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: redis:7.2-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -ex
+
+              echo "Waiting for Redis pods to be ready..."
+              sleep 30
+
+              # Vérifier que le master est accessible
+              MASTER="redis-0.redis-headless.appinventor.svc.cluster.local"
+              until redis-cli -h $MASTER -a $REDIS_PASSWORD ping | grep PONG; do
+                echo "Waiting for Redis master..."
+                sleep 5
+              done
+
+              echo "Redis master is ready!"
+
+              # Configurer les réplicas
+              for i in 1 2; do
+                REPLICA="redis-$i.redis-headless.appinventor.svc.cluster.local"
+                echo "Configuring replica: $REPLICA"
+                redis-cli -h $REPLICA -a $REDIS_PASSWORD REPLICAOF redis-0.redis-headless.appinventor.svc.cluster.local 6379 || true
+              done
+
+              echo "Redis cluster initialized successfully!"
+
+              # Afficher les infos du cluster
+              redis-cli -h $MASTER -a $REDIS_PASSWORD INFO replication
+
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+
+---
+# CronJob pour nettoyage périodique (RGPD)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-cleanup
+  namespace: appinventor
+  labels:
+    app: redis
+    component: maintenance
+spec:
+  # Tous les jours à 3h du matin (Paris time)
+  schedule: "0 3 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: redis:7.2-alpine
+              command:
+                - sh
+                - -c
+                - |
+                  set -ex
+
+                  echo "Starting Redis cleanup (RGPD compliance)..."
+
+                  MASTER="redis.appinventor.svc.cluster.local"
+
+                  # Statistiques avant nettoyage
+                  echo "=== Before cleanup ==="
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD INFO stats | grep keys
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD INFO memory | grep used_memory_human
+
+                  # Supprimer les clés expirées (normalement automatique, mais force un scan)
+                  # Note: SCAN est safe contrairement à KEYS
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD --scan --pattern "*" | wc -l
+
+                  # Déclencher un BGSAVE pour persister l'état actuel
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD BGSAVE
+
+                  # Attendre que BGSAVE se termine
+                  while redis-cli -h $MASTER -a $REDIS_PASSWORD INFO persistence | grep rdb_bgsave_in_progress:1 > /dev/null; do
+                    echo "Waiting for BGSAVE to complete..."
+                    sleep 5
+                  done
+
+                  # Statistiques après nettoyage
+                  echo "=== After cleanup ==="
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD INFO stats | grep keys
+                  redis-cli -h $MASTER -a $REDIS_PASSWORD INFO memory | grep used_memory_human
+
+                  echo "Redis cleanup completed successfully!"
+
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: redis-credentials
+                      key: password
+
+---
+# Service Monitor pour Prometheus (si activé)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-exporter-config
+  namespace: appinventor
+data:
+  redis-exporter.yaml: |
+    # Redis Exporter configuration pour monitoring
+    redis:
+      addr: redis://localhost:6379
+      password: ${REDIS_PASSWORD}
+
+    # Métriques à exporter
+    script: |
+      return {
+        info_stats = redis.call('INFO', 'stats'),
+        info_replication = redis.call('INFO', 'replication'),
+        info_memory = redis.call('INFO', 'memory'),
+        info_cpu = redis.call('INFO', 'cpu'),
+        info_keyspace = redis.call('INFO', 'keyspace'),
+        slowlog_length = redis.call('SLOWLOG', 'LEN')
+      }

@@ -1,0 +1,196 @@
+---
+# MinIO Distributed Mode (Haute Disponibilité)
+# 4 nodes minimum pour Erasure Coding
+# RGPD Compliant - Données stockées à Paris DSI uniquement
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-headless
+  namespace: appinventor
+  labels:
+    app: minio
+    component: storage
+spec:
+  clusterIP: None  # Headless service pour StatefulSet
+  ports:
+    - port: 9000
+      name: api
+      protocol: TCP
+    - port: 9001
+      name: console
+      protocol: TCP
+  selector:
+    app: minio
+  publishNotReadyAddresses: true
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: appinventor
+  labels:
+    app: minio
+    component: storage
+    compliance: rgpd
+spec:
+  serviceName: minio-headless
+  replicas: 4  # 4 nodes minimum pour distributed mode
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+        component: storage
+    spec:
+      # Anti-affinity pour distribuer les pods sur différents nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - minio
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2024-01-01T00-00-00Z  # Version stable
+          args:
+            - server
+            # Distributed mode avec 4 nodes
+            - http://minio-{0...3}.minio-headless.appinventor.svc.cluster.local/data
+            - --console-address
+            - ":9001"
+
+          env:
+            # Credentials depuis secrets
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: root-user
+
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: root-password
+
+            # Configuration optimale
+            - name: MINIO_PROMETHEUS_AUTH_TYPE
+              value: "public"
+
+            # Activer le chiffrement (RGPD)
+            - name: MINIO_KMS_AUTO_ENCRYPTION
+              value: "on"
+
+            # Région (fictive mais cohérente)
+            - name: MINIO_REGION
+              value: "eu-west-3"  # Paris
+
+          ports:
+            - containerPort: 9000
+              name: api
+              protocol: TCP
+            - containerPort: 9001
+              name: console
+              protocol: TCP
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          # Ressources (adaptées à vos serveurs)
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "1000m"
+            limits:
+              memory: "8Gi"
+              cpu: "2000m"
+
+          # Volume mount
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+  # Volume Claim Templates
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: minio
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: bulk-storage  # HDD RAID
+        resources:
+          requests:
+            storage: 2Ti  # À ajuster selon vos besoins
+
+---
+# ConfigMap pour configuration MinIO avancée (optionnel)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-config
+  namespace: appinventor
+data:
+  # Configuration bucket lifecycle (suppression auto APK après 1 jour)
+  lifecycle.json: |
+    {
+      "Rules": [
+        {
+          "ID": "DeleteOldBuilds",
+          "Status": "Enabled",
+          "Expiration": {
+            "Days": 1
+          },
+          "Filter": {
+            "Prefix": "appinventor-builds/"
+          }
+        }
+      ]
+    }
+
+  # Configuration de notification (optionnel)
+  notify.json: |
+    {
+      "version": "1",
+      "serviceAccountID": "appinventor-notifier"
+    }

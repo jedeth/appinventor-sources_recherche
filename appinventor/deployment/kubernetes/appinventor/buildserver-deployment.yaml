@@ -1,0 +1,340 @@
+---
+# MIT App Inventor - Build Server
+# Compile les applications Android (APK/AAB)
+# RGPD Compliant - Paris DSI
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: buildserver-config
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: builder
+data:
+  build.properties: |
+    # Build Server Configuration
+
+    # Android SDK paths (dans le container)
+    android.sdk.home=/opt/android-sdk
+    android.ndk.home=/opt/android-ndk
+
+    # Build settings
+    build.timeout=600
+    build.parallel.jobs=4
+
+    # Storage pour APKs (MinIO)
+    storage.backend=s3
+    s3.endpoint=http://minio.appinventor.svc.cluster.local:9000
+    s3.bucket=appinventor-builds
+    s3.path.style=true
+
+    # Cleanup (APKs sont temporaires, 24h max)
+    apk.retention.hours=24
+
+    # Logging
+    log.level=INFO
+
+    # RGPD
+    data.location=paris-dsi
+    timezone=Europe/Paris
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildserver
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: builder
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9990
+      name: http
+      protocol: TCP
+      targetPort: 9990
+  selector:
+    app: buildserver
+    component: builder
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildserver
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: builder
+    compliance: rgpd
+spec:
+  # Plus de réplicas pour paralléliser les builds
+  replicas: 5
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+
+  selector:
+    matchLabels:
+      app: buildserver
+      component: builder
+
+  template:
+    metadata:
+      labels:
+        app: buildserver
+        component: builder
+
+    spec:
+      # Anti-affinity (distribuer les builds)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - buildserver
+                topologyKey: kubernetes.io/hostname
+
+      # Init container
+      initContainers:
+        - name: wait-for-minio
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for MinIO..."
+              until nc -z minio.appinventor.svc.cluster.local 9000; do
+                echo "MinIO not ready, waiting..."
+                sleep 5
+              done
+              echo "MinIO is ready!"
+
+      containers:
+        - name: buildserver
+          # NOTE: Cette image doit être construite avec Android SDK/NDK
+          # Voir: appinventor/deployment/docker/Dockerfile.buildserver
+          image: localhost:5000/appinventor-buildserver:latest
+          imagePullPolicy: Always
+
+          # Variables d'environnement
+          env:
+            # Java heap pour builds (besoin de beaucoup de RAM)
+            - name: JAVA_OPTS
+              value: "-Xmx16g -Xms8g -XX:+UseG1GC"
+
+            # TimeZone
+            - name: TZ
+              value: "Europe/Paris"
+
+            # Build server password (pour authentification depuis webapp)
+            - name: BUILD_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: buildserver-credentials
+                  key: password
+
+            # MinIO credentials
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: access-key
+
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secret-key
+
+            # Android SDK License acceptance
+            - name: ANDROID_SDK_ROOT
+              value: "/opt/android-sdk"
+
+            - name: ANDROID_HOME
+              value: "/opt/android-sdk"
+
+          ports:
+            - containerPort: 9990
+              name: http
+              protocol: TCP
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9990
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9990
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Ressources (builds nécessitent beaucoup de CPU et RAM)
+          resources:
+            requests:
+              memory: "20Gi"
+              cpu: "8000m"
+            limits:
+              memory: "24Gi"
+              cpu: "12000m"
+
+          # Volume mounts
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: build-cache
+              mountPath: /build-cache
+            - name: tmp
+              mountPath: /tmp
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # Build process needs writes
+            capabilities:
+              drop:
+                - ALL
+
+      # Volumes
+      volumes:
+        - name: config
+          configMap:
+            name: buildserver-config
+
+        # Cache pour accélérer les builds (Gradle, Maven)
+        - name: build-cache
+          emptyDir:
+            sizeLimit: 50Gi
+
+        - name: tmp
+          emptyDir:
+            sizeLimit: 20Gi
+
+---
+# HorizontalPodAutoscaler pour scaling selon la charge
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: buildserver
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: builder
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: buildserver
+  minReplicas: 5
+  maxReplicas: 15  # Peut monter à 15 si beaucoup de builds simultanés
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: buildserver
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: builder
+spec:
+  minAvailable: 3  # Au moins 3 build servers disponibles
+  selector:
+    matchLabels:
+      app: buildserver
+      component: builder
+
+---
+# CronJob pour nettoyer les vieux APKs (RGPD compliance)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: buildserver-cleanup
+  namespace: appinventor
+  labels:
+    app: buildserver
+    component: cleanup
+spec:
+  # Toutes les heures
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: minio/mc:latest
+              command:
+                - sh
+                - -c
+                - |
+                  set -ex
+
+                  echo "Configuring MinIO client..."
+                  mc alias set minio http://minio.appinventor.svc.cluster.local:9000 \
+                    $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
+
+                  echo "Cleaning up APKs older than 24 hours (RGPD compliance)..."
+
+                  # Supprimer les fichiers > 24h
+                  mc rm --recursive --force --older-than 24h \
+                    minio/appinventor-builds/
+
+                  echo "Cleanup completed!"
+
+                  # Statistiques
+                  mc du minio/appinventor-builds/
+
+              env:
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: access-key
+
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: secret-key

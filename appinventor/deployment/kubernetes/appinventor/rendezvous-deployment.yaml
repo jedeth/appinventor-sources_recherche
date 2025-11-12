@@ -1,0 +1,313 @@
+---
+# MIT App Inventor - Rendezvous Server
+# WebRTC signaling server for AI Companion
+# Phase 1 - Redis Backend (Google-independent)
+# RGPD Compliant - Paris DSI
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rendezvous-config
+  namespace: appinventor
+  labels:
+    app: rendezvous
+    component: webrtc
+data:
+  rendezvous.env: |
+    # Cache Backend (Phase 1)
+    CACHE_BACKEND=redis
+
+    # Redis Configuration
+    REDIS_HOST=redis.appinventor.svc.cluster.local
+    REDIS_PORT=6379
+    # REDIS_PASSWORD sera injecté via Secret
+
+    # Redis Sentinel (pour HA)
+    REDIS_SENTINEL_ENABLED=true
+    REDIS_SENTINEL_MASTER=appinventor-redis
+    REDIS_SENTINEL_NODES=redis-sentinel.appinventor.svc.cluster.local:26379
+
+    # Server Configuration
+    PORT=8888
+    NODE_ENV=production
+
+    # WebRTC Configuration
+    RENDEZVOUS_KEY_EXPIRY=3600
+    RENDEZVOUS_CODE_LENGTH=6
+
+    # Logging
+    LOG_LEVEL=info
+
+    # RGPD
+    DATA_LOCATION=paris-dsi
+    TIMEZONE=Europe/Paris
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rendezvous
+  namespace: appinventor
+  labels:
+    app: rendezvous
+    component: webrtc
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8888
+      name: http
+      protocol: TCP
+      targetPort: 8888
+  selector:
+    app: rendezvous
+    component: webrtc
+  sessionAffinity: ClientIP  # Important pour WebRTC
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rendezvous
+  namespace: appinventor
+  labels:
+    app: rendezvous
+    component: webrtc
+    compliance: rgpd
+spec:
+  replicas: 3  # 3 réplicas pour HA
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: rendezvous
+      component: webrtc
+
+  template:
+    metadata:
+      labels:
+        app: rendezvous
+        component: webrtc
+
+    spec:
+      # Anti-affinity
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - rendezvous
+                topologyKey: kubernetes.io/hostname
+
+      # Init container pour attendre Redis
+      initContainers:
+        - name: wait-for-redis
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Redis..."
+              until nc -z redis.appinventor.svc.cluster.local 6379; do
+                echo "Redis not ready, waiting..."
+                sleep 5
+              done
+              echo "Redis is ready!"
+
+      containers:
+        - name: rendezvous
+          # NOTE: Cette image doit être construite à partir du code Phase 1
+          # Voir: appinventor/misc/rendezvous/Dockerfile
+          # Contient: rendezvous.js, cache-adapter.js, package.json
+          image: localhost:5000/appinventor-rendezvous:latest
+          imagePullPolicy: Always
+
+          # Variables d'environnement
+          env:
+            # Configuration depuis ConfigMap
+            - name: CACHE_BACKEND
+              value: "redis"
+
+            - name: REDIS_HOST
+              value: "redis.appinventor.svc.cluster.local"
+
+            - name: REDIS_PORT
+              value: "6379"
+
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+
+            - name: REDIS_SENTINEL_ENABLED
+              value: "true"
+
+            - name: REDIS_SENTINEL_MASTER
+              value: "appinventor-redis"
+
+            - name: REDIS_SENTINEL_NODES
+              value: "redis-sentinel.appinventor.svc.cluster.local:26379"
+
+            - name: PORT
+              value: "8888"
+
+            - name: NODE_ENV
+              value: "production"
+
+            - name: TZ
+              value: "Europe/Paris"
+
+            # Logging
+            - name: LOG_LEVEL
+              value: "info"
+
+          ports:
+            - containerPort: 8888
+              name: http
+              protocol: TCP
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Ressources (Node.js est léger)
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+          # Sécurité
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rendezvous
+  namespace: appinventor
+  labels:
+    app: rendezvous
+    component: webrtc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rendezvous
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rendezvous
+  namespace: appinventor
+  labels:
+    app: rendezvous
+    component: webrtc
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: rendezvous
+      component: webrtc
+
+---
+# ServiceMonitor pour Prometheus (optionnel)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rendezvous-monitoring
+  namespace: appinventor
+data:
+  metrics.js: |
+    // Prometheus metrics pour rendezvous server
+    const promClient = require('prom-client');
+
+    // Create a Registry
+    const register = new promClient.Registry();
+
+    // Add default metrics
+    promClient.collectDefaultMetrics({ register });
+
+    // Custom metrics
+    const connectionCounter = new promClient.Counter({
+      name: 'rendezvous_connections_total',
+      help: 'Total number of rendezvous connections',
+      registers: [register]
+    });
+
+    const activeConnections = new promClient.Gauge({
+      name: 'rendezvous_active_connections',
+      help: 'Current number of active connections',
+      registers: [register]
+    });
+
+    const connectionDuration = new promClient.Histogram({
+      name: 'rendezvous_connection_duration_seconds',
+      help: 'Duration of rendezvous connections',
+      buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300],
+      registers: [register]
+    });
+
+    module.exports = {
+      register,
+      connectionCounter,
+      activeConnections,
+      connectionDuration
+    };
