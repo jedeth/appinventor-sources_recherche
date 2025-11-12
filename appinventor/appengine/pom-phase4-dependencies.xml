@@ -1,0 +1,187 @@
+<!--
+  Phase 4 Dependencies for pom.xml
+  Add these to your existing appinventor/appengine/pom.xml file
+
+  These dependencies are required for PostgreSQL support (replacing Google Datastore)
+-->
+
+<dependencies>
+    <!-- Existing dependencies... -->
+
+    <!-- ============================================ -->
+    <!-- PHASE 4: PostgreSQL Database Support -->
+    <!-- ============================================ -->
+
+    <!-- PostgreSQL JDBC Driver -->
+    <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <version>42.7.1</version>
+    </dependency>
+
+    <!-- HikariCP - High-performance connection pool -->
+    <dependency>
+        <groupId>com.zaxxer</groupId>
+        <artifactId>HikariCP</artifactId>
+        <version>5.1.0</version>
+    </dependency>
+
+    <!-- Flyway - Database migrations (optional but recommended) -->
+    <dependency>
+        <groupId>org.flywaydb</groupId>
+        <artifactId>flyway-core</artifactId>
+        <version>10.4.1</version>
+    </dependency>
+    <dependency>
+        <groupId>org.flywaydb</groupId>
+        <artifactId>flyway-database-postgresql</artifactId>
+        <version>10.4.1</version>
+    </dependency>
+
+    <!-- JSON support (for settings fields) -->
+    <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>2.10.1</version>
+    </dependency>
+
+    <!-- SLF4J - Logging facade (if not already present) -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>2.0.9</version>
+    </dependency>
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-jdk14</artifactId>
+        <version>2.0.9</version>
+    </dependency>
+
+    <!-- ============================================ -->
+    <!-- Testing Dependencies -->
+    <!-- ============================================ -->
+
+    <!-- JUnit 5 (Jupiter) -->
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter-api</artifactId>
+        <version>5.10.1</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter-engine</artifactId>
+        <version>5.10.1</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Mockito - Mocking framework -->
+    <dependency>
+        <groupId>org.mockito</groupId>
+        <artifactId>mockito-core</artifactId>
+        <version>5.8.0</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.mockito</groupId>
+        <artifactId>mockito-junit-jupiter</artifactId>
+        <version>5.8.0</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Testcontainers - For integration tests with real PostgreSQL -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>postgresql</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
+
+</dependencies>
+
+<!--
+  Maven Plugin Configuration
+  Add this to your <build><plugins> section
+-->
+<build>
+    <plugins>
+        <!-- Compiler Plugin - Java 17 -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>3.11.0</version>
+            <configuration>
+                <source>17</source>
+                <target>17</target>
+                <encoding>UTF-8</encoding>
+            </configuration>
+        </plugin>
+
+        <!-- Surefire Plugin - Unit tests -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>3.2.2</version>
+            <configuration>
+                <includes>
+                    <include>**/*Test.java</include>
+                    <include>**/*Tests.java</include>
+                </includes>
+            </configuration>
+        </plugin>
+
+        <!-- Failsafe Plugin - Integration tests -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <version>3.2.2</version>
+            <executions>
+                <execution>
+                    <goals>
+                        <goal>integration-test</goal>
+                        <goal>verify</goal>
+                    </goals>
+                </execution>
+            </executions>
+        </plugin>
+
+        <!-- Flyway Plugin - Database migrations -->
+        <plugin>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-maven-plugin</artifactId>
+            <version>10.4.1</version>
+            <configuration>
+                <url>jdbc:postgresql://localhost:5432/appinventor</url>
+                <user>appinventor_user</user>
+                <password>${db.password}</password>
+                <locations>
+                    <location>filesystem:src/main/resources/db/migration</location>
+                </locations>
+            </configuration>
+        </plugin>
+    </plugins>
+</build>
+
+<!--
+  Usage:
+
+  1. Merge these dependencies into your existing pom.xml
+  2. Run: mvn clean install
+  3. Run Flyway migrations: mvn flyway:migrate
+  4. Run tests: mvn test
+
+  Note: Make sure to replace ${db.password} with actual password
+  or set it via environment variable: export DB_PASSWORD=your_password
+-->
